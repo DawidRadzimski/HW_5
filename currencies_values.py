@@ -1,56 +1,81 @@
-import aiohttp
 import asyncio
+import aiohttp
 import json
-import os
 from datetime import datetime, timedelta
-from aiofile import async_open
-from aiopath import AsyncPath
+import os
 
-class ExchangeRatesFetcher:
-    def __init__(self):
-        self.base_url = 'http://api.nbp.pl/api/exchangerates/tables/C/'
-        self.output_folder = 'exchange_data'  # nazwa folderu do zapisu danych
+class NBPCurrencyRateRetriever:
+    """startDate, endDate format YYYY-MM-DD"""
 
-    async def fetch_exchange_rates(self, days, currencies):
-        async with aiohttp.ClientSession() as session:
-            tasks = [self.fetch_exchange_rates_for_day(session, days - i, currencies) for i in range(days)]
-            return await asyncio.gather(*tasks)
+    def __init__(self, startDate: str, endDate: str, currency_codes={"EUR", "USD"}) -> None:
+        self.currency_codes = currency_codes
+        self.startDate = startDate
+        self.endDate = endDate
+        self.output_folder = 'exchange_rates'
 
-    async def fetch_exchange_rates_for_day(self, session, days_ago, currencies):
-        date = datetime.now() - timedelta(days=days_ago)
-        url = f"{self.base_url}{date.strftime('%Y-%m-%d')}/"
+    async def fetch_exchange_rates(self, session, table="c"):
+        if self.startDate == self.endDate:
+            url = f"https://api.nbp.pl/api/exchangerates/tables/{table}/{self.startDate}?format=json"
+        else:
+            url = f"http://api.nbp.pl/api/exchangerates/tables/{table}/{self.startDate}/{self.endDate}/?format=json"
+
         try:
             async with session.get(url) as response:
-                data = await response.json()
-                return {date.strftime('%d.%m.%Y'): self.extract_currency_info(data, currencies)}
-        except aiohttp.ClientError as e:
-            print(f"Error fetching data for {date.strftime('%d.%m.%Y')}: {e}")
-            return {}
+                if response.status == 200:
+                    data = await response.json()
+                    return data
+                else:
+                    return None
+        except aiohttp.ClientConnectorError as err:
+            print(f"Connection error when asking NBP API for currency rates: {str(err)}")
 
-    def extract_currency_info(self, data, currencies):
-        currency_info = {}
-        for item in data[0]['rates']:
-            if item['code'] in currencies:
-                currency_info[item['code']] = {'sale': item['ask'], 'purchase': item['bid']}
-        return currency_info
+    async def retrieve_exchange_rates(self):
+        async with aiohttp.ClientSession() as session:
+            result = await self.fetch_exchange_rates(session, table="c")
+            return result
+
+    def run(self):
+        results = asyncio.run(self.retrieve_exchange_rates())
+        output = self.pretty_output(results)
+        self.save_to_json(output)  # Zapisuje dane do pliku JSON
+        return output
+
+    def pretty_output(self, nbp_data) -> str:
+        if nbp_data is None:
+            return "No data available"
+
+        merged_results = {result["effectiveDate"]: result["rates"] for result in nbp_data}
+
+        exchange_rates = []
+        for day, rate_data in merged_results.items():
+            if rate_data is None:
+                exchange_rates.append({day: "No exchange rates available"})
+            else:
+                selected_currencies = list(
+                    filter(lambda x: x["code"] in self.currency_codes, rate_data)
+                )
+                reformatted = {
+                    curr["code"]: {"sale": curr["ask"], "purchase": curr["bid"]}
+                    for curr in selected_currencies
+                }
+                exchange_rates.append({day: reformatted})
+
+        return json.dumps(exchange_rates, indent=4)
 
     def save_to_json(self, data):
-        if not os.path.exists(self.output_folder):  # sprawdź, czy folder istnieje
-            os.makedirs(self.output_folder)  # jeśli nie, utwórz go
+        if not os.path.exists(self.output_folder):
+            os.makedirs(self.output_folder)
         output_file_path = os.path.join(self.output_folder, 'exchange_rates.json')
         with open(output_file_path, 'w') as file:
-            json.dump(data, file, indent=2)
+            file.write(data)
         print(f"Exchange rates saved to {output_file_path}")
 
-async def main():
-    # Pytamy użytkownika o ilość dni i wybrane waluty
-    days = int(input("Ile dni? "))
-    currencies = input("Jakie waluty? (oddzielone spacją) ").split()
-
-    exchange_fetcher = ExchangeRatesFetcher()
-    exchange_rates = await exchange_fetcher.fetch_exchange_rates(days, currencies)
-    exchange_fetcher.save_to_json(exchange_rates)
-    print(exchange_rates)
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    startDate = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
+    endDate = datetime.now().strftime("%Y-%m-%d")
+    currency_codes = {"EUR", "USD"}
+
+    retriever = NBPCurrencyRateRetriever(startDate=startDate, endDate=endDate, currency_codes=currency_codes)
+    output = retriever.run()
+
+    print(output)
